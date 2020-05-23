@@ -19,29 +19,29 @@ class MLP(object):
 
     def hid_layer(self,x,dropout):
         if dropout:
-            W = dy.dropout(dy.parameter(self._W1),0.3)
-            b = dy.dropout(dy.parameter(self._b1),0.3)
+            W = dy.dropout(self._W1,0.3)
+            b = dy.dropout(self._b1,0.3)
         else:
-            W = dy.parameter(self._W1)
-            b = dy.parameter(self._b1)
+            W = self._W1
+            b = self._b1
         return self.activation(W*x+b)
 
     def hid_2_layer(self,x,dropout):
         if dropout:
-            W = dy.dropout(dy.parameter(self._W12),0.3)
-            b = dy.dropout(dy.parameter(self._b12),0.3)
+            W = dy.dropout(self._W12,0.3)
+            b = dy.dropout(self._b12,0.3)
         else:
-            W = dy.parameter(self._W12)
-            b = dy.parameter(self._b12)
+            W = self._W12
+            b = self._b12
         return self.activation(W*x+b)
 
     def out_layer(self,x,dropout):
         if dropout:
-            W = dy.dropout(dy.parameter(self._W2),0.3)
-            b = dy.dropout(dy.parameter(self._b2),0.3)
+            W = dy.dropout(self._W2,0.3)
+            b = dy.dropout(self._b2,0.3)
         else:
-            W = dy.parameter(self._W2)
-            b = dy.parameter(self._b2)
+            W = self._W2
+            b = self._b2
         return (W*x+b)
 
     def __call__(self,x):
@@ -71,13 +71,13 @@ class biMLP(MLP):
 
     def hid_layer(self,x,y,dropout):
         if dropout:
-            W_h = dy.dropout(dy.parameter(self._W1_h),0.3)
-            W_d = dy.dropout(dy.parameter(self._W1_d),0.3)
-            b = dy.dropout(dy.parameter(self._b1),0.3)
+            W_h = dy.dropout(self._W1_h,0.3)
+            W_d = dy.dropout(self._W1_d,0.3)
+            b = dy.dropout(self._b1,0.3)
         else:
-            W_h = dy.parameter(self._W1_h)
-            W_d = dy.parameter(self._W1_d)
-            b = dy.parameter(self._b1)
+            W_h = self._W1_h
+            W_d = self._W1_d
+            b = self._b1
         return self.activation(W_h*x+W_d*y+b)
 
     def __call__(self,h, d):

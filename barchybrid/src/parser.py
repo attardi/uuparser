@@ -23,14 +23,15 @@ def run(experiment,options):
 
             with open(paramsfile, 'wb') as paramsfp:
                 print('Saving params to ' + paramsfile)
+                old_opts = options
                 pickle.dump((vocab, options), paramsfp)
-
+                                
                 print('Initializing the model')
                 parser = Parser(vocab, options)
         else:  #continue
             if options.continueParams:
                 paramsfile = options.continueParams
-            with open(paramsfile, 'r') as paramsfp:
+            with open(paramsfile, 'rb') as paramsfp:
                 stored_vocab, stored_options = pickle.load(paramsfp)
                 print('Initializing the model:')
                 parser = Parser(stored_vocab, stored_options)
@@ -38,6 +39,8 @@ def run(experiment,options):
             parser.Load(options.continueModel)
 
         dev_best = [options.epochs,-1.0] # best epoch, best score
+        # early stopping. Sartiano
+        no_improvements = 0
 
         for epoch in range(options.first_epoch, options.epochs+1):
 
@@ -63,7 +66,7 @@ def run(experiment,options):
                     if options.pred_eval: # evaluate the prediction against gold data
                         mean_score = 0.0
                         for treebank in pred_treebanks:
-                            score = utils.evaluate(treebank.dev_gold,treebank.outfilename,options.conllu)
+                            score = utils.evaluate(treebank.dev_gold,treebank.outfilename,options.conllu, options.src_folder)
                             print("Dev score %.2f at epoch %i for %s"%(score,epoch,treebank.name))
                             mean_score += score
                         if len(pred_treebanks) > 1: # multiling case
@@ -72,24 +75,29 @@ def run(experiment,options):
                         if options.model_selection:
                             if mean_score > dev_best[1]:
                                 dev_best = [epoch,mean_score] # update best dev score
+                                no_improvements = 0
+                            else:
+                                no_improvements += 1
                             # hack to printthe word "mean" if the dev score is an average
                             mean_string = "mean " if len(pred_treebanks) > 1 else ""
                             print("Best %sdev score %.2f at epoch %i"%(mean_string,dev_best[1],dev_best[0]))
 
+                    # stop early
+                    if no_improvements == options.early_stopping:
+                        break
 
-            # at the last epoch choose which model to copy to barchybrid.model
-            if epoch == options.epochs:
-                bestmodel_file = os.path.join(experiment.outdir,"barchybrid.model" + str(dev_best[0]))
-                model_file = os.path.join(experiment.outdir,"barchybrid.model")
-                print("Copying " + bestmodel_file + " to " + model_file)
-                copyfile(bestmodel_file,model_file)
-                best_dev_file = os.path.join(experiment.outdir,"best_dev_epoch.txt")
-                with open (best_dev_file, 'w') as fh:
-                    print("Writing best scores to: " + best_dev_file)
-                    if len(experiment.treebanks) == 1:
-                        fh.write("Best dev score %s at epoch %i\n"%(dev_best[1],dev_best[0]))
-                    else:
-                        fh.write("Best mean dev score %s at epoch %i\n"%(dev_best[1],dev_best[0]))
+        # at the last epoch choose which model to copy to barchybrid.model
+        bestmodel_file = os.path.join(experiment.outdir,"barchybrid.model" + str(dev_best[0]))
+        model_file = os.path.join(experiment.outdir,"barchybrid.model")
+        print("Copying " + bestmodel_file + " to " + model_file)
+        copyfile(bestmodel_file,model_file)
+        best_dev_file = os.path.join(experiment.outdir,"best_dev_epoch.txt")
+        with open (best_dev_file, 'w') as fh:
+            print("Writing best scores to: " + best_dev_file)
+            if len(experiment.treebanks) == 1:
+                fh.write("Best dev score %s at epoch %i\n"%(dev_best[1],dev_best[0]))
+            else:
+                fh.write("Best mean dev score %s at epoch %i\n"%(dev_best[1],dev_best[0]))
 
     else: #if predict - so
 
@@ -98,6 +106,15 @@ def run(experiment,options):
         with open(params, 'rb') as paramsfp:
             stored_vocab, stored_opt = pickle.load(paramsfp)
 
+            print('before', stored_opt)
+            stored_opt.ensure_value('enable_gpu', options.enable_gpu)
+            stored_opt.ensure_value('albert', options.albert)
+            stored_opt.ensure_value('bert', options.bert)
+            stored_opt.ensure_value('attention', options.attention)
+            stored_opt.ensure_value('albert_pretrained_model', options.albert_pretrained_model)
+            stored_opt.ensure_value('bert_pretrained_model', options.bert_pretrained_model)
+            print('after', stored_opt)
+                        
             # we need to update/add certain options based on new user input
             utils.fix_stored_options(stored_opt,options)
 
@@ -123,11 +140,11 @@ def run(experiment,options):
             utils.write_conll_multiling(pred,experiment.treebanks)
 
             te = time.time()
-
+            print('Parsing Time: %.2gs'%(te-ts))
             if options.pred_eval:
                 for treebank in experiment.treebanks:
                     print("Evaluating on " + treebank.name)
-                    score = utils.evaluate(treebank.test_gold,treebank.outfilename,options.conllu)
+                    score = utils.evaluate(treebank.test_gold,treebank.outfilename,options.conllu, options.src_folder)
                     print("Obtained LAS F1 score of %.2f on %s" %(score,treebank.name))
 
             print('Finished predicting')
@@ -154,6 +171,29 @@ if __name__ == '__main__':
                       default=1.0, help="Gamma factor to tune ELMo.")
     parser.add_option("--elmo_learn_gamma", action="store_true",
                       default=False, help="Learn the gamma factor for ELMo.")
+    # Sartiano
+    parser.add_option("--albert", action="store_true",
+                      help="Use Albert transformer.")
+    parser.add_option("--albert-pretrained-model", default="albert-base-v2",
+                      help="Albert model to use.")
+    parser.add_option("--bert", action="store_true", help="Use Bert transformer.")
+    parser.add_option("--bert-pretrained-model", help="Bert model to use.")
+    parser.add_option("--bert-pretrained-config", help="Bert config to use.")
+    parser.add_option("--bert-tokenizer", default='bert-base-multilingual-cased',
+                      help="Bert tokenizer to use.")
+
+    # Sartiano
+    parser.add_option("--attention",
+                      default='',
+                      help="layer/head pair, e.g. 8,10")
+
+    # Sartiano
+    parser.add_option("--distance-probe-conf", help="Distance Probe configuration file")
+    parser.add_option("--src-folder", default='./src', help="SRC folder")
+    parser.add_option("--enable-gpu", action="store_true",
+                      default=False, help="Enable GPU")
+    parser.add_option("--early-stopping", type="int", metavar="INTEGER", default=5,
+                      help='Stop if no improvement after these many epochs')
 
     group = OptionGroup(parser, "Experiment options")
     group.add_option("--include", metavar="LIST", help="List of languages by ISO code to be run \
@@ -271,6 +311,13 @@ each")
 
     # really important to do this before anything else to make experiments reproducible
     utils.set_seeds(options)
+
+    # Enable GPU. Attardi
+    if options.enable_gpu:
+        import dynet_config
+        dynet_config.set_gpu()
+        import torch
+        torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
     om = OptionsManager(options)
     experiments = om.create_experiment_list(options) # list of namedtuples

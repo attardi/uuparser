@@ -107,6 +107,9 @@ class UDtreebank(Treebank):
 
 class ParseForest:
     def __init__(self, sentence):
+        """
+        :param sentence: list of ConllEntry
+        """
         self.roots = list(sentence)
 
         for root in self.roots:
@@ -413,14 +416,14 @@ def normalize(word):
     return 'NUM' if numberRegex.match(word) else word.lower()
 
 
-def evaluate(gold,test,conllu):
+def evaluate(gold,test,conllu,src_folder='./src'):
     scoresfile = test + '.txt'
     print("Writing to " + scoresfile)
     if not conllu:
         #os.system('perl src/utils/eval.pl -g ' + gold + ' -s ' + test  + ' > ' + scoresfile + ' &')
-        os.system('perl src/utils/eval.pl -g ' + gold + ' -s ' + test  + ' > ' + scoresfile )
+        os.system('perl {}/utils/eval.pl -g '.format(src_folder) + gold + ' -s ' + test  + ' > ' + scoresfile )
     else:
-        os.system('python src/utils/evaluation_script/conll17_ud_eval.py -v -w src/utils/evaluation_script/weights.clas ' + gold + ' ' + test + ' > ' + scoresfile)
+        os.system('python {}/utils/evaluation_script/conll17_ud_eval.py -v -w {}/utils/evaluation_script/weights.clas '.format(src_folder, src_folder) + gold + ' ' + test + ' > ' + scoresfile)
     score = get_LAS_score(scoresfile,conllu)
     return score
 

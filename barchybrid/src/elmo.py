@@ -5,7 +5,7 @@ import h5py
 import numpy as np
 
 
-class ELMo(object):
+class ELMo():
 
     def __init__(self, elmo_file, gamma=1.0, learn_gamma=False):
         print("Reading ELMo embeddings from '%s'" % elmo_file)

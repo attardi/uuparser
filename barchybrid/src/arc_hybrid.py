@@ -6,6 +6,7 @@ import numpy as np
 from copy import deepcopy
 from collections import defaultdict
 import json
+import sys
 
 class ArcHybridLSTM:
     def __init__(self, vocab, options):
@@ -33,28 +34,58 @@ class ArcHybridLSTM:
         self.rlMostFlag = options.rlMostFlag
         self.rlFlag = options.rlFlag
         self.k = options.k
+        self.distances = 4    # probe looks at distances between tokens ahead, considering distances:
+        # normalized by the smallest, among:
+        # s0 - b0
+        # s0 - b1
+        # b0 - closest bi: if < s0-b0, do a Shift
+        # closest si - b0	: if ~= s0-b0, do a reduce
 
         #dimensions depending on extended features
         self.nnvecs = (1 if self.headFlag else 0) + (2 if self.rlFlag or self.rlMostFlag else 0)
         self.feature_extractor = FeatureExtractor(self.model, options, vocab, self.nnvecs)
         self.irels = self.feature_extractor.irels
 
-        if options.no_bilstms > 0:
+        if options.no_bilstms > 0: # number of bilistms
             mlp_in_dims = options.lstm_output_size*2*self.nnvecs*(self.k+1)
         else:
             mlp_in_dims = self.feature_extractor.lstm_input_size*self.nnvecs*(self.k+1)
 
+        # use attention
+        if options.bert and options.attention:
+            # add attention vectors for stack to top buf and viceversa
+            attention_size = self.k * 2
+            # all layers
+            #layers = self.feature_extractor.bert.model.config.num_hidden_layers
+            #attention_size = layers * layers * self.k # * 2
+            mlp_in_dims += attention_size
+
+        # Sartiano
+        if options.distance_probe_conf:
+            print('Distance Probe enabled', file=sys.stderr)
+            from distance_probe import DistanceProbe
+            self.distance_probe = DistanceProbe(options.distance_probe_conf, options.dynet_seed)
+            mlp_in_dims += self.distances
+        else:
+            self.distance_probe = None
+
+        self.attention_indices = [int(x) for x in options.attention.split(',')] if options.attention else []
+
         self.unlabeled_MLP = MLP(self.model, 'unlabeled', mlp_in_dims, options.mlp_hidden_dims,
-                                 options.mlp_hidden2_dims, 4, self.activation)
-        self.labeled_MLP = MLP(self.model, 'labeled' ,mlp_in_dims, options.mlp_hidden_dims,
-                               options.mlp_hidden2_dims,2*len(self.irels)+2,self.activation)
+                                 options.mlp_hidden2_dims, SWAP+1, self.activation)
+        self.labeled_MLP = MLP(self.model, 'labeled', mlp_in_dims, options.mlp_hidden_dims,
+                               options.mlp_hidden2_dims, 2*len(self.irels)+2, self.activation)
+        print('MLP size: (%d, %d)' % (mlp_in_dims, options.mlp_hidden_dims), file=sys.stderr)
 
-
-    def __evaluate(self, stack, buf, train):
+    def __evaluate(self, stack, buf, train, attn_maps, dst_matrix):
         """
+        :param attn: a matrix [layers, heads, sent_len, sent_len]
+        :param dst_matrix: distance matrix computed by syntax probe.
+
         ret = [left arc,
-               right arc
-               shift]
+               right arc,
+               shift,
+	       swap]
 
         RET[i] = (rel, transition, score1, score2) for shift, l_arc and r_arc
          shift = 2 (==> rel=None) ; l_arc = 0; r_acr = 1
@@ -68,10 +99,115 @@ class ArcHybridLSTM:
         topStack = [ stack.roots[-i-1].lstms if len(stack) > i else [empty] for i in range(self.k) ]
         topBuffer = [ buf.roots[i].lstms if len(buf) > i else [empty] for i in range(1) ]
 
-        input = dy.concatenate(list(chain(*(topStack + topBuffer))))
+        # check if not None otherwise is ambiguous
+        if dst_matrix is not None:
+            # s0 - b0
+            # s0 - b1
+            # b0 - closest bi: if < s0-b0, do a Shift
+            # closest si - b0	: if ~= s0-b0, do a reduce
+            if len(stack) and len(buf) > 1:        # root token is at end of buffer
+                b0_id = buf.roots[0].id
+                # graph distances of b0
+                # -1 since tokens are numbered from 1
+                b0_distances = dst_matrix[b0_id-1]
+                s0_id = stack.roots[-1].id
+                # graph distances of s0
+                s0_distances = dst_matrix[s0_id-1]
+
+                s0_b0 = b0_distances[s0_id-1]
+                s0_b1 = s0_distances[buf.roots[1].id-1]
+                if b0_id < len(s0_distances) - 1: # at least one token after b0
+                    s0_bi = min(s0_distances[b0_id:])
+                else:
+                    s0_bi = 100
+                if len(stack) > 1:
+                    si_b0 = min([b0_distances[tok.id] for tok in stack.roots[:-1]])
+                else:
+                    si_b0 = 100
+                
+                rel_dist = [s0_b0, s0_b1, s0_bi, si_b0]
+            else:
+                rel_dist = [100] * self.distances
+            rel_dist = [dy.inputTensor(rel_dist)]
+
+            # #noClose = [dy.scalarInput(-1, self.device)] * self.feature_extractor.pretrained_embeddings_size
+            # topStackDistances = [10000] * self.k
+            # if len(buf):        # sanity check: always true
+            #     # -1 since tokens are numbered from 1
+            #     # graph distances of top k elements on stack to top buffer
+            #     topBufferDistances = dst_matrix[buf.roots[0].id-1]
+            #     for i, entry in enumerate(stack.roots[:self.k]):
+            #         # -1 since token id start from 1
+            #         distance = topBufferDistances[entry.id-1]
+            #         # backwards
+            #         topStackDistances[-i-1] = distance
+            #     tbd_np = np.array(topBufferDistances)
+            #     tbd_np = tbd_np / tbd_np.min() # normalization
+            #     topBufferDistances = [dy.inputTensor(tbd_np)]
+
+            # # lookahead. Sartiano
+            # # add token at distance 1 to topStack, appearing after topBuf
+            # closeToStack = noClose
+            # if len(stack):
+            #     topStackId = stack.roots[-1].id
+            #     for entry in buf.roots[1:]: # skip topBuf
+            #         bufTok = entry.id-1
+            #         if dst_matrix[bufTok, topStackId-1] == 1:
+            #             closeToStack = buf.roots[bufTok].vecs[self.feature_extractor.pretrained_embeddings]
+            #             break
+            # closeToBuf = noClose
+            # topBufId = buf.roots[0].id
+            # for entry in buf.roots[1:]: # skip topBuf
+            #     bufTok = entry.id-1
+            #     if dst_matrix[bufTok, topBufId-1] == 1:
+            #         closeToBuf = buf.roots[bufTok].vecs[self.feature_extractor.pretrained_embeddings]
+            #         break
+            # # Add the embeddings of closeToStack and closeTobuf:
+            # deprels = [ closeToStack, closeToBuf ]
+
+            # input = dy.concatenate(list(chain(*(topStack + topBuffer + deprels + topStackDistances))))
+            #input = dy.concatenate(list(chain(*(topStack + topBuffer + topStackDistances))))
+            input = dy.concatenate(list(chain(*(topStack + topBuffer + rel_dist))))
+        elif self.attention_indices:
+            # get attention vectors for the stack and buf tokens wrt the top buf
+            attentions = [dy.scalarInput(-10.0)] * self.k * 2
+            # all layers
+            #layers = self.feature_extractor.bert.model.config.num_hidden_layers
+            #attentions = [[dy.scalarInput(-10.0)] * layers * layers] * self.k # 2
+            if len(buf):        # sanity check: always true
+                topBufId = buf.roots[0].id
+                # attn of top k elements on stack to top buffer
+                for i, entry in enumerate(stack.roots[-self.k:]):
+                    # -1 since tokens are numbered from 1
+                    layer, head = self.attention_indices
+                    attn = attn_maps[layer, head, entry.id-1, topBufId-1]
+                    attentions[i] = dy.scalarInput(attn)
+                    #attn = attn_maps[:, :, topBufId-1, entry.id-1].flatten().cpu().numpy()
+                    #attentions[i] = dy.inputTensor(attn) #, self.device)
+                # add attention from buf elements to top as well
+                for i, entry in enumerate(buf.roots[1:self.k]): # skip top
+                    # -1 since tokens are numbered from 1
+                    layer, head = self.attention_indices
+                    attn = attn_maps[layer, head, entry.id-1, topBufId-1]
+                    attentions[self.k+i] = dy.scalarInput(attn) #, self.device)
+            # use all layers:
+            # attentions = [[dy.scalarInput(-10.0)] * layers * layers] * self.k # 2
+            # if len(buf):        # sanity check: always true
+            #     topBufId = buf.roots[0].id
+            #     # attn of top k elements on stack to top buffer and viceversa
+            #     for i, entry in enumerate(stack.roots[:-self.k]):
+            #         # -1 since tokens are numbered from 1
+            #         #layer, head = self.attention_indices
+            #         #attn = attn_maps[:, :, entry.id-1, topBufId-1].flatten().cpu().numpy()
+            #         #attentions[i] = dy.inputTensor(attn)
+            #         attn = attn_maps[:, :, topBufId-1, entry.id-1].flatten().cpu().numpy()
+            #         attentions[i] = dy.inputTensor(attn) #, self.device)
+            input = dy.concatenate(list(chain(*(topStack + topBuffer + attentions))))
+        else:
+            input = dy.concatenate(list(chain(*(topStack + topBuffer))))
+
         output = self.unlabeled_MLP(input)
         routput = self.labeled_MLP(input)
-
 
         #scores, unlabeled scores
         scrs, uscrs = routput.value(), output.value()
@@ -100,8 +236,8 @@ class ArcHybridLSTM:
 
 
             ret = [ [ (rel, LEFT_ARC, scrs[2 + j * 2] + uscrs2, routput[2 + j * 2 ] + output2) for j, rel in enumerate(self.irels) ] if left_arc_conditions else [],
-                   [ (rel, RIGHT_ARC, scrs[3 + j * 2] + uscrs3, routput[3 + j * 2 ] + output3) for j, rel in enumerate(self.irels) ] if right_arc_conditions else [],
-                   [ (None, SHIFT, scrs[0] + uscrs0, routput[0] + output0) ] if shift_conditions else [] ,
+                    [ (rel, RIGHT_ARC, scrs[3 + j * 2] + uscrs3, routput[3 + j * 2 ] + output3) for j, rel in enumerate(self.irels) ] if right_arc_conditions else [],
+                    [ (None, SHIFT, scrs[0] + uscrs0, routput[0] + output0) ] if shift_conditions else [] ,
                     [ (None, SWAP, scrs[1] + uscrs1, routput[1] + output1) ] if swap_conditions else [] ]
         else:
             s1,r1 = max(zip(scrs[2::2],self.irels))
@@ -109,18 +245,18 @@ class ArcHybridLSTM:
             s1 += uscrs2
             s2 += uscrs3
             ret = [ [ (r1, LEFT_ARC, s1) ] if left_arc_conditions else [],
-                   [ (r2, RIGHT_ARC, s2) ] if right_arc_conditions else [],
-                   [ (None, SHIFT, scrs[0] + uscrs0) ] if shift_conditions else [] ,
+                    [ (r2, RIGHT_ARC, s2) ] if right_arc_conditions else [],
+                    [ (None, SHIFT, scrs[0] + uscrs0) ] if shift_conditions else [] ,
                     [ (None, SWAP, scrs[1] + uscrs1) ] if swap_conditions else [] ]
         return ret
 
 
     def Save(self, filename):
-        print('Saving model to ' + filename)
+        print('Saving model to ' + filename, file=sys.stderr)
         self.model.save(filename)
 
     def Load(self, filename):
-        print('Loading model from ' + filename)
+        print('Loading model from ' + filename, file=sys.stderr)
         self.model.populate(filename)
 
 
@@ -221,7 +357,7 @@ class ArcHybridLSTM:
                 set(test_words) - self.feature_extractor.words.keys()
 
             print("Number of OOV word types at test time: %i (out of %i)" %
-                  (len(new_test_words), len(test_words)))
+                  (len(new_test_words), len(test_words)), file=sys.stderr)
 
             if len(new_test_words) > 0:
                 # no point loading embeddings if there are no words to look for
@@ -236,13 +372,13 @@ class ArcHybridLSTM:
                 if len(test_langs) > 1 and test_embeddings["words"]:
                     print("External embeddings found for %i words "\
                           "(out of %i)" % \
-                          (len(test_embeddings["words"]), len(new_test_words)))
+                          (len(test_embeddings["words"]), len(new_test_words)), file=sys.stderr)
 
         if options.char_emb_size > 0:
             new_test_chars = \
                 set(test_chars) - self.feature_extractor.chars.keys()
             print("Number of OOV char types at test time: %i (out of %i)" %
-                  (len(new_test_chars), len(test_chars)))
+                  (len(new_test_chars), len(test_chars)), file=sys.stderr)
 
             if len(new_test_chars) > 0:
                 for lang in test_langs:
@@ -257,7 +393,7 @@ class ArcHybridLSTM:
                 if len(test_langs) > 1 and test_embeddings["chars"]:
                     print("External embeddings found for %i chars "\
                           "(out of %i)" % \
-                          (len(test_embeddings["chars"]), len(new_test_chars)))
+                          (len(test_embeddings["chars"]), len(new_test_chars)), file=sys.stderr)
 
         data = utils.read_conll_dir(treebanks,datasplit,char_map=char_map)
         for iSentence, osentence in enumerate(data,1):
@@ -268,7 +404,24 @@ class ArcHybridLSTM:
             self.feature_extractor.Init(options)
             conll_sentence = [entry for entry in sentence if isinstance(entry, utils.ConllEntry)]
             conll_sentence = conll_sentence[1:] + [conll_sentence[0]]
-            self.feature_extractor.getWordEmbeddings(conll_sentence, False, options, test_embeddings)
+
+            dst_matrix = None
+            if self.distance_probe:
+                tokens = [tok.form for tok in conll_sentence]
+                # dst_matrix = {'tokens': tokens, 'matrix': self.distance_probe.calc(tokens)}
+                dst_matrix = self.distance_probe.calc(tokens)
+
+            # set the embeddings into root.vec of each sentence token
+            try:
+                sentence = self.feature_extractor.getWordEmbeddings(conll_sentence, False, options, test_embeddings)
+            except ValueError as e:
+                print(e, file=sys.stderr)
+                continue
+
+            attn_maps = None
+            if self.attention_indices:
+                attn_maps = sentence.attentions
+
             stack = ParseForest([])
             buf = ParseForest(conll_sentence)
 
@@ -281,12 +434,12 @@ class ArcHybridLSTM:
 
 
             while not (len(buf) == 1 and len(stack) == 0):
-                scores = self.__evaluate(stack, buf, False)
+                scores = self.__evaluate(stack, buf, False, attn_maps, dst_matrix)
                 best = max(chain(*(scores if iSwap < max_swap else scores[:3] )), key = itemgetter(2) )
                 if iSwap == max_swap and not reached_swap_for_i_sentence:
                     reached_max_swap += 1
                     reached_swap_for_i_sentence = True
-                    print("reached max swap in %d out of %d sentences"%(reached_max_swap, iSentence))
+                    print("reached max swap in %d out of %d sentences"%(reached_max_swap, iSentence), file=sys.stderr)
                 self.apply_transition(best,stack,buf,hoffset)
                 if best[1] == SWAP:
                     iSwap += 1
@@ -315,7 +468,7 @@ class ArcHybridLSTM:
         start = time.time()
 
         random.shuffle(trainData) # in certain cases the data will already have been shuffled after being read from file or while creating dev data
-        print("Length of training data: ", len(trainData))
+        print("Length of training data: ", len(trainData), file=sys.stderr)
 
         errs = []
 
@@ -328,7 +481,7 @@ class ArcHybridLSTM:
                 ' Errors: %.3f'%((float(eerrors)) / etotal)+\
                 ' Labeled Errors: %.3f'%(float(lerrors) / etotal)+\
                 ' Time: %.2gs'%(time.time()-start)
-                print(loss_message)
+                print(loss_message, file=sys.stderr)
                 start = time.time()
                 eerrors = 0
                 eloss = 0.0
@@ -336,10 +489,26 @@ class ArcHybridLSTM:
                 lerrors = 0
 
             sentence = deepcopy(sentence) # ensures we are working with a clean copy of sentence and allows memory to be recycled each time round the loop
-
+            
             conll_sentence = [entry for entry in sentence if isinstance(entry, utils.ConllEntry)]
-            conll_sentence = conll_sentence[1:] + [conll_sentence[0]]
-            self.feature_extractor.getWordEmbeddings(conll_sentence, True, options)
+            conll_sentence = conll_sentence[1:] + [conll_sentence[0]] # move root to the end
+
+            dst_matrix = None
+            if self.distance_probe:
+                tokens = [tok.form for tok in conll_sentence]
+                dst_matrix = self.distance_probe.calc(tokens)
+
+            # set the embeddings into root.vec of each sentence token
+            try:
+                sentence = self.feature_extractor.getWordEmbeddings(conll_sentence, True, options)
+            except ValueError as e:
+                print(e, file=sys.stderr)
+                continue
+
+            attn_maps = None
+            if self.attention_indices:
+                attn_maps = sentence.attentions
+
             stack = ParseForest([])
             buf = ParseForest(conll_sentence)
             hoffset = 1 if self.headFlag else 0
@@ -350,7 +519,7 @@ class ArcHybridLSTM:
                 root.relation = root.relation if root.relation in self.irels else 'runk'
 
             while not (len(buf) == 1 and len(stack) == 0):
-                scores = self.__evaluate(stack, buf, True)
+                scores = self.__evaluate(stack, buf, True, attn_maps, dst_matrix)
 
                 #to ensure that we have at least one wrong operation
                 scores.append([(None, 4, ninf ,None)])
@@ -432,5 +601,5 @@ class ArcHybridLSTM:
             dy.renew_cg()
 
         self.trainer.update()
-        print("Loss: ", mloss/iSentence)
-        print("Total Training Time: %.2gs" % (time.time()-beg))
+        print("Loss: ", mloss/iSentence, file=sys.stderr)
+        print("Total Training Time: %.2gs" % (time.time()-beg), file=sys.stderr)

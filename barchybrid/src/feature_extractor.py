@@ -4,7 +4,8 @@ import dynet as dy
 import numpy as np
 import random
 from collections import defaultdict
-import re, os
+import sys
+#import re, os
 
 class FeatureExtractor(object):
     def __init__(self, model, options, vocab, nnvecs=1):
@@ -13,6 +14,8 @@ class FeatureExtractor(object):
 
         self.model = model
         self.nnvecs = nnvecs
+
+        self.device = 'cuda' if options.enable_gpu else ''
 
         # Load ELMo if the option is set
         if options.elmo is not None:
@@ -26,6 +29,20 @@ class FeatureExtractor(object):
         else:
             self.elmo = None
 
+        # Load Albert if the option is set
+        if options.albert:
+            from albert import Albert
+            self.albert = Albert(pretrained_model=options.albert_pretrained_model)
+        else:
+            self.albert = None
+
+        # Load Bert if the option is set
+        if options.bert:
+            from bert import Bert
+            self.bert = Bert(options.bert_pretrained_model, options.bert_pretrained_config, options.bert_tokenizer)
+        else:
+            self.bert = None
+        
         extra_words = 2 # MLP padding vector and OOV vector
         self.words = {word: ind for ind, word in enumerate(words,extra_words)}
         self.word_lookup = self.model.add_lookup_parameters((len(self.words)+extra_words, options.word_emb_size))
@@ -98,14 +115,21 @@ class FeatureExtractor(object):
 
             self.init_lookups(options)
 
+        # Sartiano
         elmo_emb_size = self.elmo.emb_dim if self.elmo else 0
+        albert_emb_size = self.albert.emb_dim if self.albert else 0
+        bert_emb_size = self.bert.emb_dim if self.bert else 0
+
+        self.pretrained_embeddings_size = (
+            elmo_emb_size + albert_emb_size + bert_emb_size)
+        
         self.lstm_input_size = (
-                options.word_emb_size + elmo_emb_size +
+                options.word_emb_size + self.pretrained_embeddings_size +
                 options.pos_emb_size + options.tbank_emb_size +
                 2 * (options.char_lstm_output_size
                      if options.char_emb_size > 0 else 0)
         )
-        print("Word-level LSTM input size: " + str(self.lstm_input_size))
+        print("Word-level LSTM input size: " + str(self.lstm_input_size), file=sys.stderr)
 
         self.bilstms = []
         if options.no_bilstms > 0:
@@ -130,24 +154,37 @@ class FeatureExtractor(object):
 
     def Init(self,options):
         paddingWordVec = self.word_lookup[1] if options.word_emb_size > 0 else None
-        paddingElmoVec = dy.zeros(self.elmo.emb_dim) if self.elmo else None
+        paddingElmoVec = dy.inputTensor(np.zeros((self.elmo.emb_dim, 1)), self.device) if self.elmo else None
+        paddingAlbertVec = dy.inputTensor(np.zeros((self.albert.emb_dim, 1)), self.device) if self.albert else None
+        paddingBertVec = dy.inputTensor(np.zeros((self.bert.emb_dim, 1)), self.device) if self.bert else None
         paddingPosVec = self.pos_lookup[1] if options.pos_emb_size > 0 else None
         paddingCharVec = self.charPadding.expr() if options.char_emb_size > 0 else None
         paddingTbankVec = self.treebank_lookup[0] if options.tbank_emb_size > 0 else None
 
-        self.paddingVec = dy.tanh(self.word2lstm.expr() *\
-            dy.concatenate(list(filter(None,[paddingWordVec,
+        paddings = dy.concatenate(list(filter(None,[paddingWordVec,
                                         paddingElmoVec,
+                                        paddingAlbertVec,
+                                        paddingBertVec,
                                         paddingPosVec,
                                         paddingCharVec,
-                                        paddingTbankVec]))) + self.word2lstmbias.expr())
+                                        paddingTbankVec])))
+        self.paddingVec = dy.tanh(self.word2lstm.expr() *\
+            paddings + self.word2lstmbias.expr())
 
         self.empty = self.paddingVec if self.nnvecs == 1 else\
             dy.concatenate([self.paddingVec for _ in range(self.nnvecs)])
 
 
     def getWordEmbeddings(self, sentence, train, options, test_embeddings=defaultdict(lambda:{})):
+        """
+        Fills root.vec of tokens in :param sentence: with corresponding embedding.
 
+        :param train: boolean whether training or predicting.
+        :return: a Sentence object representing the sentence.
+        """
+
+        sentence_representation = None
+        
         if self.elmo:
             # Get full text of sentence - excluding root, which is loaded differently 
             # for transition and graph-based parsers. 
@@ -156,8 +193,31 @@ class FeatureExtractor(object):
             else:
                 sentence_text = " ".join([entry.form for entry in sentence[:-1]])
 
-            elmo_sentence_representation = \
+            sentence_representation = \
                 self.elmo.get_sentence_representation(sentence_text)
+
+        if self.albert:
+            # Get full text of sentence - excluding root, which is loaded differently 
+            # for transition and graph-based parsers. 
+            if options.graph_based:
+                sentence_text = " ".join([entry.form for entry in sentence[1:]])
+            else:
+                sentence_text = " ".join([entry.form for entry in sentence[:-1]])
+
+            sentence_representation = \
+                self.albert.get_sentence_representation(sentence_text)
+
+        if self.bert:
+            # Get full text of sentence - excluding root, which is loaded differently 
+            # for transition and graph-based parsers. 
+            if options.graph_based:
+                sentence_text = " ".join([entry.form for entry in sentence[1:]])
+            else:
+                sentence_text = " ".join([entry.form for entry in sentence[:-1]])
+
+            sentence_representation = \
+                self.bert.get_sentence_representation(sentence_text)
+
 
         for i, root in enumerate(sentence):
             root.vecs = defaultdict(lambda: None) # all vecs are None by default (possibly a little risky?)
@@ -170,7 +230,7 @@ class FeatureExtractor(object):
                     if root.norm in self.words:
                         root.vecs["word"] = self.word_lookup[self.words[root.norm]]
                     elif root.norm in test_embeddings["words"]:
-                        root.vecs["word"] = dy.inputVector(test_embeddings["words"][root.norm])
+                        root.vecs["word"] = dy.inputVector(test_embeddings["words"][root.norm], self.device)
                     else:
                         root.vecs["word"] = self.word_lookup[0]
             if options.pos_emb_size > 0:
@@ -186,26 +246,58 @@ class FeatureExtractor(object):
                     treebank_id = root.treebank_id
                 # this is a bit of a hack for models trained on an old version of the code
                 # that used treebank name rather than id as the lookup
+                
                 if not treebank_id in self.treebanks and treebank_id in utils.reverse_iso_dict and \
                     utils.reverse_iso_dict[treebank_id] in self.treebanks:
                     treebank_id = utils.reverse_iso_dict[treebank_id]
-                root.vecs["treebank"] = self.treebank_lookup[self.treebanks[treebank_id]]
+                if treebank_id is not None:
+                    root.vecs["treebank"] = self.treebank_lookup[self.treebanks[treebank_id]]
+            # lookahead
+            # self.pretrained_embeddings = ''
             if self.elmo:
+                # lookahead
+                # self.pretrained_embeddings = 'elmo'
                 if i < len(sentence) - 1:
                     # Don't look up the 'root' word
-                    root.vecs["elmo"] = elmo_sentence_representation[i]
+                    root.vecs["elmo"] = sentence_representation[i]
                 else:
                     # TODO
-                    root.vecs["elmo"] = dy.zeros(self.elmo.emb_dim)
+                    root.vecs["elmo"] = dy.inputTensor(np.zeros((self.elmo.emb_dim, 1)), self.device)
+
+            if self.albert:
+                # lookahead
+                # self.pretrained_embeddings = 'albert'
+                if i < len(sentence) - 1:
+                    # Don't look up the 'root' word
+                    root.vecs["albert"] = sentence_representation[i]
+                else:
+                    # TODO
+                    root.vecs["albert"] = dy.inputTensor(np.zeros((self.albert.emb_dim, 1)), self.device)
+
+            if self.bert:
+                # lookahead
+                # self.pretrained_embeddings = 'bert'
+                if i < len(sentence) - 1:
+                    # Don't look up the 'root' word
+                    root.vecs["bert"] = sentence_representation[i]
+                else:
+                    # TODO
+                    # dy.zeros() doesn't have a device='cuda' parameter
+                    #root.vecs["bert"] = dy.zeros(self.bert.emb_dim)
+                    root.vecs["bert"] = dy.inputTensor(np.zeros((self.bert.emb_dim, 1)), self.device)
 
             root.vec = dy.concatenate(list(filter(None, [root.vecs["word"],
                                                     root.vecs["elmo"],
+                                                    root.vecs["albert"],
+                                                    root.vecs["bert"],
                                                     root.vecs["pos"],
                                                     root.vecs["char"],
                                                          root.vecs["treebank"]])))
 
         for bilstm in self.bilstms:
             bilstm.set_token_vecs(sentence,train)
+
+        return sentence_representation
 
     def get_char_vector(self,root,train,test_embeddings_chars={}):
 
@@ -217,7 +309,7 @@ class FeatureExtractor(object):
                 if char in self.chars:
                     char_vecs.append(self.char_lookup[self.chars[char]])
                 elif char in test_embeddings_chars:
-                    char_vecs.append(dy.inputVector(test_embeddings_chars[char]))
+                    char_vecs.append(dy.inputVector(test_embeddings_chars[char], self.device))
                 else:
                     char_vecs.append(self.char_lookup[0])
             return self.char_bilstm.get_sequence_vector(char_vecs,train)
@@ -225,19 +317,19 @@ class FeatureExtractor(object):
     def init_lookups(self,options):
 
         if self.external_embedding["words"]:
-            print('Initialising %i word vectors with external embeddings'%len(self.external_embedding["words"]))
+            print('Initialising %i word vectors with external embeddings'%len(self.external_embedding["words"]), file=sys.stderr)
             for word in self.external_embedding["words"]:
                 if len(self.external_embedding["words"][word]) != options.word_emb_size:
                     raise Exception("Size of external embedding does not match specified word embedding size of %s"%(options.word_emb_size))
                 self.word_lookup.init_row(self.words[word],self.external_embedding["words"][word])
         elif options.word_emb_size > 0:
-            print('No word external embeddings found: all vectors initialised randomly')
+            print('No word external embeddings found: all vectors initialised randomly', file=sys.stderr)
 
         if self.external_embedding["chars"]:
-            print('Initialising %i char vectors with external embeddings'%len(self.external_embedding["chars"]))
+            print('Initialising %i char vectors with external embeddings'%len(self.external_embedding["chars"]), file=sys.stderr)
             for char in self.external_embedding["chars"]:
                 if len(self.external_embedding["chars"][char]) != options.char_emb_size:
                     raise Exception("Size of external embedding does not match specified char embedding size of %s"%(options.char_emb_size))
                 self.char_lookup.init_row(self.chars[char],self.external_embedding["chars"][char])
         elif options.char_emb_size > 0:
-            print('No character external embeddings found: all vectors initialised randomly')
+            print('No character external embeddings found: all vectors initialised randomly', file=sys.stderr)

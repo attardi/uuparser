@@ -1,6 +1,6 @@
 import dynet as dy
 
-class BiLSTM(object):
+class BiLSTM():
     def __init__(self,in_dim,out_dim,model,dropout_rate=None):
         self.dropout_rate = dropout_rate
         self.surfaceBuilders = [dy.VanillaLSTMBuilder(1, in_dim, out_dim, model),
